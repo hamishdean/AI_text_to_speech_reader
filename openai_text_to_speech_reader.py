@@ -5,6 +5,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import threading
 import queue
+import concurrent.futures
 import os
 import tempfile
 import docx
@@ -58,9 +59,11 @@ class TTSApp:
         self.voice_var = tk.StringVar(value="alloy")
         self.model_var = tk.StringVar(value="tts-1")
         self.speed_var = tk.StringVar(value="1.0x")
+        self.concurrency_var = tk.StringVar(value="3")
         self.voices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
         self.models = ["tts-1", "tts-1-hd"]
         self.speeds = ["1.0x", "1.25x", "1.5x", "1.75x", "2.0x", "2.5x", "3.0x", "4.0x"]
+        self.concurrency_options = ["1", "2", "3", "4", "5"]
         self.stop_requested = False
         self.is_processing = False
         self.batch_temp_files = []
@@ -91,6 +94,10 @@ class TTSApp:
         ttk.Label(settings_frame, text="Speed:").grid(row=2, column=0, sticky=tk.W, pady=5)
         speed_dropdown = ttk.Combobox(settings_frame, textvariable=self.speed_var, values=self.speeds, state="readonly", width=10)
         speed_dropdown.grid(row=2, column=1, sticky=tk.W, padx=5, pady=5)
+
+        ttk.Label(settings_frame, text="Parallel:").grid(row=2, column=2, sticky=tk.W, padx=(15, 0), pady=5)
+        concurrency_dropdown = ttk.Combobox(settings_frame, textvariable=self.concurrency_var, values=self.concurrency_options, state="readonly", width=5)
+        concurrency_dropdown.grid(row=2, column=3, sticky=tk.W, padx=5, pady=5)
 
         settings_frame.columnconfigure(1, weight=1)
 
@@ -264,15 +271,21 @@ class TTSApp:
         model = self.model_var.get()
         voice = self.voice_var.get()
 
+        # Parse concurrency
+        try:
+            max_workers = int(self.concurrency_var.get())
+        except ValueError:
+            max_workers = 3
+
         # Queue for producer (generator) -> consumer (player) communication
         # Items are (batch_num, temp_file) tuples, or None as a sentinel for "done"
         self.audio_queue = queue.Queue()
         self.generator_error = None
 
-        # Launch producer and consumer threads
+        # Launch producer coordinator and consumer threads
         threading.Thread(
-            target=self.generate_batches,
-            args=(api_key, batches, voice, model, speed, total),
+            target=self.generate_batches_concurrent,
+            args=(api_key, batches, voice, model, speed, total, max_workers),
             daemon=True
         ).start()
         threading.Thread(
@@ -281,8 +294,33 @@ class TTSApp:
             daemon=True
         ).start()
 
-    def generate_batches(self, api_key, batches, voice, model, speed, total):
-        """Producer: generate audio files via OpenAI API and enqueue them."""
+    def generate_single_batch(self, client, batch_index, batch_text, voice, model, speed, total):
+        """Worker: generate audio for a single batch. Returns (batch_num, temp_file)."""
+        batch_num = batch_index + 1
+        self.root.after(0, lambda n=batch_num, chars=len(batch_text): self.log_batch(
+            f"Batch {n}/{total}: Generating audio ({chars} chars)..."
+        ))
+
+        temp_dir = tempfile.gettempdir()
+        temp_file = os.path.join(temp_dir, f"tts_batch_{os.getpid()}_{batch_index}.mp3")
+
+        response = client.audio.speech.create(
+            model=model,
+            voice=voice,
+            input=batch_text,
+            speed=speed,
+        )
+        response.stream_to_file(temp_file)
+
+        self.root.after(0, lambda n=batch_num: self.log_batch(
+            f"Batch {n}/{total}: Audio generated, ready to play."
+        ))
+
+        return batch_num, temp_file
+
+    def generate_batches_concurrent(self, api_key, batches, voice, model, speed, total, max_workers):
+        """Coordinator: submit all batches to a thread pool, then feed results to
+        the playback queue in order."""
         try:
             client = OpenAI(api_key=api_key)
         except Exception as e:
@@ -290,49 +328,56 @@ class TTSApp:
             self.audio_queue.put(None)
             return
 
-        for i, batch_text in enumerate(batches):
-            if self.stop_requested:
-                self.audio_queue.put(None)
-                return
+        generated_count = 0
 
-            batch_num = i + 1
-            self.root.after(0, lambda n=batch_num, chars=len(batch_text): self.log_batch(
-                f"Batch {n}/{total}: Generating audio ({chars} chars)..."
-            ))
-
-            try:
-                temp_dir = tempfile.gettempdir()
-                temp_file = os.path.join(temp_dir, f"tts_batch_{os.getpid()}_{i}.mp3")
-                self.batch_temp_files.append(temp_file)
-
-                response = client.audio.speech.create(
-                    model=model,
-                    voice=voice,
-                    input=batch_text,
-                    speed=speed,
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all batches to the pool
+            futures = {}
+            for i, batch_text in enumerate(batches):
+                if self.stop_requested:
+                    break
+                future = executor.submit(
+                    self.generate_single_batch,
+                    client, i, batch_text, voice, model, speed, total
                 )
-                response.stream_to_file(temp_file)
+                futures[i] = future
 
-                self.root.after(0, lambda n=batch_num: self.log_batch(
-                    f"Batch {n}/{total}: Audio generated, ready to play."
-                ))
-                self.root.after(0, lambda n=batch_num: self.progress_bar.configure(value=n))
+            # Collect results in order so playback stays sequential
+            for i in range(len(batches)):
+                if self.stop_requested:
+                    # Cancel any pending futures
+                    for f in futures.values():
+                        f.cancel()
+                    self.audio_queue.put(None)
+                    return
 
-            except AuthenticationError:
-                self.generator_error = "Invalid OpenAI API Key."
-                self.audio_queue.put(None)
-                return
-            except APIConnectionError:
-                self.generator_error = "Network error. Please check your connection."
-                self.audio_queue.put(None)
-                return
-            except Exception as e:
-                self.generator_error = f"Error on batch {batch_num}:\n{str(e)}"
-                self.audio_queue.put(None)
-                return
+                if i not in futures:
+                    break
 
-            # Enqueue the ready file for the player thread
-            self.audio_queue.put((batch_num, temp_file))
+                try:
+                    batch_num, temp_file = futures[i].result()
+                    self.batch_temp_files.append(temp_file)
+                    generated_count += 1
+                    self.root.after(0, lambda n=generated_count: self.progress_bar.configure(value=n))
+                    self.audio_queue.put((batch_num, temp_file))
+                except AuthenticationError:
+                    self.generator_error = "Invalid OpenAI API Key."
+                    for f in futures.values():
+                        f.cancel()
+                    self.audio_queue.put(None)
+                    return
+                except APIConnectionError:
+                    self.generator_error = "Network error. Please check your connection."
+                    for f in futures.values():
+                        f.cancel()
+                    self.audio_queue.put(None)
+                    return
+                except Exception as e:
+                    self.generator_error = f"Error on batch {i + 1}:\n{str(e)}"
+                    for f in futures.values():
+                        f.cancel()
+                    self.audio_queue.put(None)
+                    return
 
         # Signal that all batches have been generated
         self.audio_queue.put(None)
