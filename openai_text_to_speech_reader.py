@@ -6,6 +6,7 @@ from tkinter import ttk, filedialog, messagebox
 import threading
 import queue
 import concurrent.futures
+import re
 import os
 import tempfile
 import docx
@@ -44,12 +45,97 @@ def split_text_into_batches(text, limit=BATCH_CHAR_LIMIT):
     return batches
 
 
+def apply_filters(text, filters):
+    """Apply the enabled filters to text and return the cleaned version."""
+    if filters.get("urls"):
+        text = re.sub(r'https?://\S+', '', text)
+
+    if filters.get("emails"):
+        text = re.sub(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b', '', text)
+
+    if filters.get("round_brackets"):
+        text = re.sub(r'\([^)]*\)', '', text)
+
+    if filters.get("square_brackets"):
+        text = re.sub(r'\[[^\]]*\]', '', text)
+
+    if filters.get("curly_brackets"):
+        text = re.sub(r'\{[^}]*\}', '', text)
+
+    if filters.get("angle_brackets"):
+        text = re.sub(r'<[^>]*>', '', text)
+
+    if filters.get("tables"):
+        # Remove lines that look like table rows (contain multiple | or tab separators)
+        lines = text.split('\n')
+        filtered = []
+        for line in lines:
+            stripped = line.strip()
+            # Table separator lines like |---|---|
+            if re.match(r'^[\s|+\-:=]+$', stripped) and '|' in stripped:
+                continue
+            # Lines with 2+ pipe separators (table cells)
+            if stripped.count('|') >= 2:
+                continue
+            # Lines with 3+ tab separators (tab-delimited tables)
+            if stripped.count('\t') >= 2:
+                continue
+            filtered.append(line)
+        text = '\n'.join(filtered)
+
+    if filters.get("page_numbers"):
+        # Standalone page numbers (lines that are just a number, optionally with "Page" prefix)
+        text = re.sub(r'(?m)^\s*(?:Page\s*)?\d{1,5}\s*$', '', text, flags=re.IGNORECASE)
+
+    if filters.get("headers_footers"):
+        # Remove lines that are likely headers/footers:
+        # - Very short lines (<=5 chars) that are all caps or just numbers/symbols
+        # - Common header/footer patterns
+        lines = text.split('\n')
+        filtered = []
+        for line in lines:
+            stripped = line.strip()
+            # Skip very short all-caps lines (likely headers)
+            if 0 < len(stripped) <= 5 and stripped.isupper():
+                continue
+            # Common footer patterns
+            if re.match(r'^\s*[-—]\s*\d+\s*[-—]\s*$', stripped):
+                continue
+            # "Page X of Y" patterns
+            if re.match(r'^\s*page\s+\d+\s+(of|/)\s+\d+\s*$', stripped, re.IGNORECASE):
+                continue
+            filtered.append(line)
+        text = '\n'.join(filtered)
+
+    if filters.get("citations"):
+        # Remove citation markers like [1], [2,3], (Author, 2020), (Author et al., 2020)
+        text = re.sub(r'\[\d+(?:[,;\s]+\d+)*\]', '', text)
+        text = re.sub(r'\([A-Z][a-z]+(?:\s+(?:et\s+al\.|and|&)\s+[A-Z][a-z]+)*,?\s*\d{4}[a-z]?\)', '', text)
+
+    if filters.get("special_chars"):
+        # Remove standalone special characters and symbols, keep basic punctuation
+        text = re.sub(r'[#*~^\\|`@$%&]+', '', text)
+
+    if filters.get("extra_whitespace"):
+        # Collapse multiple blank lines into one, trim trailing spaces
+        text = re.sub(r'[ \t]+', ' ', text)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        text = re.sub(r'(?m)^ +| +$', '', text)
+
+    if filters.get("footnotes"):
+        # Remove footnote markers (superscript-style numbers) and footnote lines
+        # Lines starting with a small number followed by text (footnote definitions)
+        text = re.sub(r'(?m)^\s{0,4}\d{1,3}[\.\)]\s+.{0,200}$', '', text)
+
+    return text.strip()
+
+
 class TTSApp:
     def __init__(self, root):
         self.root = root
         self.root.title("OpenAI Text-to-Speech Reader")
-        self.root.geometry("700x700")
-        self.root.minsize(500, 500)
+        self.root.geometry("700x750")
+        self.root.minsize(500, 550)
 
         # Initialize pygame mixer for audio playback
         pygame.mixer.init()
@@ -67,6 +153,26 @@ class TTSApp:
         self.stop_requested = False
         self.is_processing = False
         self.batch_temp_files = []
+
+        # Filter toggle variables
+        self.filter_vars = {}
+        self.filter_definitions = [
+            ("urls",            "URLs",                     "Remove http:// and https:// links"),
+            ("emails",          "Email Addresses",          "Remove email addresses"),
+            ("round_brackets",  "Round Brackets (...)",     "Remove text inside parentheses"),
+            ("square_brackets", "Square Brackets [...]",    "Remove text inside square brackets"),
+            ("curly_brackets",  "Curly Brackets {...}",     "Remove text inside curly braces"),
+            ("angle_brackets",  "Angle Brackets <...>",     "Remove HTML/XML tags and angle bracket content"),
+            ("tables",          "Tables",                   "Remove table rows (pipe-separated or tab-delimited)"),
+            ("page_numbers",    "Page Numbers",             "Remove standalone page numbers"),
+            ("headers_footers", "Headers & Footers",        "Remove repeated short lines, 'Page X of Y' patterns"),
+            ("citations",       "Citations & References",   "Remove citation markers like [1] or (Author, 2020)"),
+            ("special_chars",   "Special Characters",       "Remove symbols like # * ~ ^ \\ | ` @ $ % &"),
+            ("extra_whitespace","Extra Whitespace",         "Collapse multiple blank lines and trim spaces"),
+            ("footnotes",       "Footnotes",                "Remove footnote markers and footnote definition lines"),
+        ]
+        for key, _, _ in self.filter_definitions:
+            self.filter_vars[key] = tk.BooleanVar(value=False)
 
         self.create_widgets()
 
@@ -101,11 +207,18 @@ class TTSApp:
 
         settings_frame.columnconfigure(1, weight=1)
 
-        # --- Middle Section: Text Area ---
-        text_frame = ttk.LabelFrame(main_frame, text="Text Content", padding="10")
+        # --- Tabbed Notebook ---
+        self.notebook = ttk.Notebook(main_frame)
+        self.notebook.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+
+        # === Tab 1: Reader ===
+        reader_tab = ttk.Frame(self.notebook, padding="5")
+        self.notebook.add(reader_tab, text="Reader")
+
+        # Text Content
+        text_frame = ttk.LabelFrame(reader_tab, text="Text Content", padding="10")
         text_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
 
-        # Toolbar for text area
         toolbar = ttk.Frame(text_frame)
         toolbar.pack(fill=tk.X, pady=(0, 5))
 
@@ -113,34 +226,35 @@ class TTSApp:
         ttk.Button(toolbar, text="Load DOCX", command=self.load_docx).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(toolbar, text="Clear Text", command=self.clear_text).pack(side=tk.LEFT)
 
-        # Text Widget with Scrollbar
         self.text_area = tk.Text(text_frame, wrap=tk.WORD, font=("Segoe UI", 10))
         scrollbar = ttk.Scrollbar(text_frame, command=self.text_area.yview)
         self.text_area.configure(yscrollcommand=scrollbar.set)
-
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.text_area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # --- Batch Progress Section ---
-        batch_frame = ttk.LabelFrame(main_frame, text="Batch Progress", padding="10")
-        batch_frame.pack(fill=tk.X, pady=(0, 10))
+        # Batch Progress
+        batch_frame = ttk.LabelFrame(reader_tab, text="Batch Progress", padding="10")
+        batch_frame.pack(fill=tk.X, pady=(0, 5))
 
         self.batch_progress_var = tk.StringVar(value="No batches to process.")
-        self.batch_progress_label = ttk.Label(batch_frame, textvariable=self.batch_progress_var, wraplength=650)
+        self.batch_progress_label = ttk.Label(batch_frame, textvariable=self.batch_progress_var, wraplength=620)
         self.batch_progress_label.pack(fill=tk.X)
 
-        # Progress bar
         self.progress_bar = ttk.Progressbar(batch_frame, mode='determinate')
         self.progress_bar.pack(fill=tk.X, pady=(5, 0))
 
-        # Batch log text box
         self.batch_log = tk.Text(batch_frame, height=4, wrap=tk.WORD, font=("Segoe UI", 9), state=tk.DISABLED)
         batch_scroll = ttk.Scrollbar(batch_frame, command=self.batch_log.yview)
         self.batch_log.configure(yscrollcommand=batch_scroll.set)
         batch_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.batch_log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=(5, 0))
 
-        # --- Bottom Section: Controls ---
+        # === Tab 2: Filters ===
+        filters_tab = ttk.Frame(self.notebook, padding="5")
+        self.notebook.add(filters_tab, text="Filters")
+        self.create_filters_tab(filters_tab)
+
+        # --- Bottom Section: Controls (always visible) ---
         control_frame = ttk.Frame(main_frame)
         control_frame.pack(fill=tk.X, pady=(5, 0))
 
@@ -153,6 +267,158 @@ class TTSApp:
         self.status_var = tk.StringVar(value="Ready.")
         status_label = ttk.Label(control_frame, textvariable=self.status_var, foreground="gray")
         status_label.pack(side=tk.RIGHT)
+
+    def create_filters_tab(self, parent):
+        """Build the Filters tab with checkbuttons and action buttons."""
+        # Description
+        desc_label = ttk.Label(
+            parent,
+            text="Select filters to clean up text before sending to the TTS API. "
+                 "Use 'Apply Filters' to modify the text in place, or 'Preview' to see the result first.",
+            wraplength=620
+        )
+        desc_label.pack(fill=tk.X, pady=(0, 10))
+
+        # Filter checkbuttons in a scrollable frame
+        filter_container = ttk.LabelFrame(parent, text="Available Filters", padding="10")
+        filter_container.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+
+        # Canvas + scrollbar for the filter list
+        canvas = tk.Canvas(filter_container, highlightthickness=0)
+        filter_scrollbar = ttk.Scrollbar(filter_container, orient=tk.VERTICAL, command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=scrollable_frame, anchor=tk.NW)
+        canvas.configure(yscrollcommand=filter_scrollbar.set)
+
+        # Populate filter checkbuttons
+        for i, (key, label, description) in enumerate(self.filter_definitions):
+            row_frame = ttk.Frame(scrollable_frame)
+            row_frame.pack(fill=tk.X, pady=2)
+
+            cb = ttk.Checkbutton(row_frame, text=label, variable=self.filter_vars[key])
+            cb.pack(side=tk.LEFT)
+
+            desc = ttk.Label(row_frame, text=f"  -  {description}", foreground="gray")
+            desc.pack(side=tk.LEFT, padx=(5, 0))
+
+        filter_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Enable mouse wheel scrolling on the canvas
+        def on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        def on_mousewheel_linux(event):
+            if event.num == 4:
+                canvas.yview_scroll(-1, "units")
+            elif event.num == 5:
+                canvas.yview_scroll(1, "units")
+
+        canvas.bind("<MouseWheel>", on_mousewheel)
+        canvas.bind("<Button-4>", on_mousewheel_linux)
+        canvas.bind("<Button-5>", on_mousewheel_linux)
+
+        # Action buttons
+        btn_frame = ttk.Frame(parent)
+        btn_frame.pack(fill=tk.X, pady=(0, 5))
+
+        ttk.Button(btn_frame, text="Select All", command=self.select_all_filters).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(btn_frame, text="Deselect All", command=self.deselect_all_filters).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(btn_frame, text="Apply Filters to Text", command=self.apply_filters_to_text).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(btn_frame, text="Preview Filtered Text", command=self.preview_filtered_text).pack(side=tk.LEFT)
+
+    def select_all_filters(self):
+        for var in self.filter_vars.values():
+            var.set(True)
+
+    def deselect_all_filters(self):
+        for var in self.filter_vars.values():
+            var.set(False)
+
+    def get_active_filters(self):
+        """Return a dict of filter_key -> True for all enabled filters."""
+        return {key: var.get() for key, var in self.filter_vars.items() if var.get()}
+
+    def apply_filters_to_text(self):
+        """Apply enabled filters to the text area content in place."""
+        text = self.text_area.get(1.0, tk.END).strip()
+        if not text:
+            messagebox.showinfo("No Text", "There is no text to filter.")
+            return
+
+        active = self.get_active_filters()
+        if not active:
+            messagebox.showinfo("No Filters", "No filters are selected.")
+            return
+
+        filtered = apply_filters(text, active)
+        self.text_area.delete(1.0, tk.END)
+        self.text_area.insert(tk.END, filtered)
+
+        enabled_names = [label for key, label, _ in self.filter_definitions if self.filter_vars[key].get()]
+        self.status_var.set(f"Applied {len(enabled_names)} filter(s).")
+
+    def preview_filtered_text(self):
+        """Show filtered text in a preview window without modifying the original."""
+        text = self.text_area.get(1.0, tk.END).strip()
+        if not text:
+            messagebox.showinfo("No Text", "There is no text to preview.")
+            return
+
+        active = self.get_active_filters()
+        if not active:
+            messagebox.showinfo("No Filters", "No filters are selected.")
+            return
+
+        filtered = apply_filters(text, active)
+        original_len = len(text)
+        filtered_len = len(filtered)
+        removed = original_len - filtered_len
+
+        # Open preview window
+        preview_win = tk.Toplevel(self.root)
+        preview_win.title("Filtered Text Preview")
+        preview_win.geometry("600x500")
+        preview_win.minsize(400, 300)
+
+        info_frame = ttk.Frame(preview_win, padding="10")
+        info_frame.pack(fill=tk.X)
+
+        enabled_names = [label for key, label, _ in self.filter_definitions if self.filter_vars[key].get()]
+        ttk.Label(info_frame, text=f"Filters: {', '.join(enabled_names)}").pack(anchor=tk.W)
+        ttk.Label(
+            info_frame,
+            text=f"Original: {original_len} chars | Filtered: {filtered_len} chars | Removed: {removed} chars",
+            foreground="gray"
+        ).pack(anchor=tk.W, pady=(2, 0))
+
+        text_frame = ttk.Frame(preview_win, padding="10")
+        text_frame.pack(fill=tk.BOTH, expand=True)
+
+        preview_text = tk.Text(text_frame, wrap=tk.WORD, font=("Segoe UI", 10))
+        preview_scroll = ttk.Scrollbar(text_frame, command=preview_text.yview)
+        preview_text.configure(yscrollcommand=preview_scroll.set)
+        preview_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        preview_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        preview_text.insert(tk.END, filtered)
+        preview_text.config(state=tk.DISABLED)
+
+        btn_frame = ttk.Frame(preview_win, padding="10")
+        btn_frame.pack(fill=tk.X)
+
+        def use_filtered():
+            self.text_area.delete(1.0, tk.END)
+            self.text_area.insert(tk.END, filtered)
+            self.status_var.set(f"Applied {len(enabled_names)} filter(s).")
+            preview_win.destroy()
+
+        ttk.Button(btn_frame, text="Use This Text", command=use_filtered).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(btn_frame, text="Close", command=preview_win.destroy).pack(side=tk.LEFT)
 
     def log_batch(self, message):
         """Append a message to the batch log box."""
@@ -238,6 +504,14 @@ class TTSApp:
             messagebox.showwarning("Empty Text", "There is no text to read.")
             return
 
+        # Apply active filters before sending to TTS
+        active_filters = self.get_active_filters()
+        if active_filters:
+            text = apply_filters(text, active_filters)
+            if not text:
+                messagebox.showwarning("Empty After Filtering", "All text was removed by the active filters.")
+                return
+
         # Parse speed value
         speed_str = self.speed_var.get().replace("x", "")
         try:
@@ -253,6 +527,9 @@ class TTSApp:
             messagebox.showwarning("Empty Text", "There is no text to read.")
             return
 
+        # Switch to Reader tab to show progress
+        self.notebook.select(0)
+
         # Update UI
         self.clear_batch_log()
         self.play_btn.config(state=tk.DISABLED)
@@ -261,6 +538,10 @@ class TTSApp:
         self.is_processing = True
         self.progress_bar['value'] = 0
         self.progress_bar['maximum'] = total
+
+        if active_filters:
+            filter_count = len(active_filters)
+            self.log_batch(f"Applied {filter_count} filter(s) before processing.")
 
         if total == 1:
             self.batch_progress_var.set("1 batch to process (text fits in a single request).")
