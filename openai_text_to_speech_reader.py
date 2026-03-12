@@ -35,7 +35,9 @@ def split_text_into_batches(text, limit=BATCH_CHAR_LIMIT):
         if split_pos <= 0:
             # No good break point, hard split
             split_pos = limit
-        batches.append(text[:split_pos].strip())
+        part = text[:split_pos].strip()
+        if part:
+            batches.append(part)
         text = text[split_pos:].strip()
     return batches
 
@@ -58,8 +60,8 @@ class TTSApp:
         self.voices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
         self.models = ["tts-1", "tts-1-hd"]
         self.speeds = ["1.0x", "1.25x", "1.5x", "1.75x", "2.0x", "2.5x", "3.0x", "4.0x"]
-        self.current_temp_file = None
         self.stop_requested = False
+        self.is_processing = False
         self.batch_temp_files = []
 
         self.create_widgets()
@@ -211,9 +213,13 @@ class TTSApp:
         self.play_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
         self.status_var.set("Stopped.")
-        self.root.after(0, lambda: self.log_batch("Stopped by user."))
+        self.log_batch("Stopped by user.")
 
     def start_reading(self):
+        # Guard against starting a second batch while one is running
+        if self.is_processing:
+            return
+
         api_key = self.api_key_var.get().strip()
         text = self.text_area.get(1.0, tk.END).strip()
 
@@ -235,11 +241,16 @@ class TTSApp:
         batches = split_text_into_batches(text)
         total = len(batches)
 
+        if total == 0:
+            messagebox.showwarning("Empty Text", "There is no text to read.")
+            return
+
         # Update UI
         self.clear_batch_log()
         self.play_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
         self.stop_requested = False
+        self.is_processing = True
         self.progress_bar['value'] = 0
         self.progress_bar['maximum'] = total
 
@@ -267,7 +278,8 @@ class TTSApp:
         try:
             client = OpenAI(api_key=api_key)
         except Exception as e:
-            self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to create client:\n{str(e)}"))
+            err_msg = str(e)
+            self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to create client:\n{err_msg}"))
             self.root.after(0, self.reset_ui)
             return
 
@@ -311,7 +323,8 @@ class TTSApp:
                 self.root.after(0, self.reset_ui)
                 return
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("Error", f"Error on batch {batch_num}:\n{str(e)}"))
+                err_msg = f"Error on batch {batch_num}:\n{str(e)}"
+                self.root.after(0, lambda msg=err_msg: messagebox.showerror("Error", msg))
                 self.root.after(0, self.reset_ui)
                 return
 
@@ -334,7 +347,8 @@ class TTSApp:
                     pygame.time.Clock().tick(10)
 
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("Playback Error", f"Failed to play batch {batch_num}:\n{str(e)}"))
+                err_msg = f"Failed to play batch {batch_num}:\n{str(e)}"
+                self.root.after(0, lambda msg=err_msg: messagebox.showerror("Playback Error", msg))
                 self.root.after(0, self.reset_ui)
                 return
 
@@ -348,7 +362,11 @@ class TTSApp:
         self.cleanup_temp_files()
 
     def cleanup_temp_files(self):
-        """Remove temporary audio files."""
+        """Unload pygame music and remove temporary audio files."""
+        try:
+            pygame.mixer.music.unload()
+        except Exception:
+            pass
         for f in self.batch_temp_files:
             try:
                 if os.path.exists(f):
@@ -360,6 +378,8 @@ class TTSApp:
     def reset_ui(self):
         self.play_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
+        self.is_processing = False
+        self.cleanup_temp_files()
 
 if __name__ == "__main__":
     root = tk.Tk()
