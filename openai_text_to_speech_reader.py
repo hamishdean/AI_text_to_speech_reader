@@ -206,6 +206,7 @@ class TTSApp:
         self.elevenlabs_voices = {}  # {display_name: voice_id}
         self.elevenlabs_voice_names = ["(Fetch voices first)"]
         self.elevenlabs_models = [
+            "eleven_v3",
             "eleven_multilingual_v2",
             "eleven_turbo_v2_5",
             "eleven_monolingual_v1",
@@ -504,11 +505,7 @@ class TTSApp:
             )
 
             if resp.status_code == 401:
-                raise AuthenticationError(
-                    message="Invalid ElevenLabs API key.",
-                    response=None,
-                    body=None,
-                )
+                raise Exception("Invalid ElevenLabs API key.")
             if resp.status_code != 200:
                 raise Exception(f"ElevenLabs API error ({resp.status_code}): {resp.text[:200]}")
 
@@ -937,7 +934,7 @@ class TTSApp:
                     completed_batches += 1
                     self.root.after(0, lambda n=completed_batches: self.export_progress_bar.configure(value=n))
                 except AuthenticationError:
-                    self.root.after(0, lambda: messagebox.showerror("Error", "Invalid OpenAI API Key."))
+                    self.root.after(0, lambda p=self.provider_var.get(): messagebox.showerror("Error", f"Invalid {p} API Key."))
                     self.root.after(0, self.reset_export_ui)
                     return
                 except APIConnectionError:
@@ -982,7 +979,7 @@ class TTSApp:
                             completed_batches += 1
                             self.root.after(0, lambda n=completed_batches: self.export_progress_bar.configure(value=n))
                         except AuthenticationError:
-                            self.root.after(0, lambda: messagebox.showerror("Error", "Invalid OpenAI API Key."))
+                            self.root.after(0, lambda p=self.provider_var.get(): messagebox.showerror("Error", f"Invalid {p} API Key."))
                             error_occurred = True
                             break
                         except APIConnectionError:
@@ -1262,7 +1259,7 @@ class TTSApp:
                     self.root.after(0, lambda n=generated_count: self.progress_bar.configure(value=n))
                     self.audio_queue.put((batch_num, temp_file))
                 except AuthenticationError:
-                    self.generator_error = "Invalid OpenAI API Key."
+                    self.generator_error = f"Invalid {self.provider_var.get()} API Key."
                     for f in futures.values():
                         f.cancel()
                     self.audio_queue.put(None)
