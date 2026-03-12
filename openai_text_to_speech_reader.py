@@ -407,9 +407,9 @@ class TTSApp:
                 self.voice_var.set(self.voices[0])
             self.model_var.set(self.models[0])
 
-            # Hide speed (ElevenLabs doesn't support speed param the same way)
-            self.speed_label.grid_forget()
-            self.speed_dropdown.grid_forget()
+            # Show speed (ElevenLabs supports speed parameter)
+            self.speed_label.grid(row=4, column=0, sticky=tk.W, pady=5)
+            self.speed_dropdown.grid(row=4, column=1, sticky=tk.W, padx=5, pady=5)
 
     def fetch_elevenlabs_voices(self):
         """Fetch available voices from the ElevenLabs API."""
@@ -465,13 +465,17 @@ class TTSApp:
 
         threading.Thread(target=do_fetch, daemon=True).start()
 
-    def generate_tts_audio(self, text, voice, model, speed, response_format, output_path):
-        """Generate TTS audio using the currently selected provider.
-        Returns the output file path on success."""
-        provider = self.provider_var.get()
+    def generate_tts_audio(self, text, voice, model, speed, response_format, output_path,
+                           provider=None, api_key=None):
+        """Generate TTS audio using the specified provider.
+        provider and api_key should be passed explicitly to avoid
+        reading tkinter StringVars from background threads."""
+        if provider is None:
+            provider = self.provider_var.get()
+        if api_key is None:
+            api_key = self.get_current_api_key()
 
         if provider == "OpenAI":
-            api_key = self.api_key_var.get().strip()
             client = OpenAI(api_key=api_key)
             response = client.audio.speech.create(
                 model=model,
@@ -483,8 +487,29 @@ class TTSApp:
             response.stream_to_file(output_path)
 
         elif provider == "ElevenLabs":
-            api_key = self.elevenlabs_api_key_var.get().strip()
             voice_id = self.elevenlabs_voices.get(voice, voice)
+
+            body = {
+                "text": text,
+                "model_id": model,
+                "voice_settings": {
+                    "stability": 0.5,
+                    "similarity_boost": 0.75,
+                },
+            }
+
+            # ElevenLabs speed parameter (supported range ~0.7-1.2 depending on model)
+            if speed != 1.0:
+                body["speed"] = speed
+
+            # Map export format to ElevenLabs output_format parameter
+            el_format_map = {
+                "mp3": "mp3_44100_128",
+                "wav": "pcm_44100",
+                "flac": "mp3_44100_128",  # ElevenLabs doesn't support FLAC, fallback to mp3
+                "aac": "mp3_44100_128",   # ElevenLabs doesn't support AAC, fallback to mp3
+            }
+            output_format = el_format_map.get(response_format, "mp3_44100_128")
 
             resp = requests.post(
                 f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
@@ -493,21 +518,15 @@ class TTSApp:
                     "Content-Type": "application/json",
                     "Accept": "audio/mpeg",
                 },
-                json={
-                    "text": text,
-                    "model_id": model,
-                    "voice_settings": {
-                        "stability": 0.5,
-                        "similarity_boost": 0.75,
-                    },
-                },
+                json=body,
+                params={"output_format": output_format},
                 timeout=120,
             )
 
             if resp.status_code == 401:
                 raise Exception("Invalid ElevenLabs API key.")
             if resp.status_code != 200:
-                raise Exception(f"ElevenLabs API error ({resp.status_code}): {resp.text[:200]}")
+                raise Exception(f"ElevenLabs API error ({resp.status_code}): {resp.text[:300]}")
 
             with open(output_path, 'wb') as f:
                 f.write(resp.content)
@@ -515,7 +534,7 @@ class TTSApp:
         return output_path
 
     def get_current_api_key(self):
-        """Return the API key for the active provider."""
+        """Return the API key for the active provider. Call from main thread only."""
         if self.provider_var.get() == "ElevenLabs":
             return self.elevenlabs_api_key_var.get().strip()
         return self.api_key_var.get().strip()
@@ -883,12 +902,12 @@ class TTSApp:
         threading.Thread(
             target=self.run_export,
             args=(api_key, sections, voice, model, speed, fmt, output_path,
-                  split_by_headings, max_workers),
+                  split_by_headings, max_workers, provider),
             daemon=True
         ).start()
 
     def run_export(self, api_key, sections, voice, model, speed, fmt, output_path,
-                   split_by_headings, max_workers):
+                   split_by_headings, max_workers, provider):
         """Background thread: generate and save audio for each section."""
         total_sections = len(sections)
 
@@ -930,7 +949,8 @@ class TTSApp:
                     return
 
                 try:
-                    self.generate_tts_audio(batches[0], voice, model, speed, fmt, file_path)
+                    self.generate_tts_audio(batches[0], voice, model, speed, fmt, file_path,
+                                            provider=provider, api_key=api_key)
                     completed_batches += 1
                     self.root.after(0, lambda n=completed_batches: self.export_progress_bar.configure(value=n))
                 except AuthenticationError:
@@ -959,7 +979,8 @@ class TTSApp:
                         temp_file = os.path.join(tempfile.gettempdir(), f"export_{os.getpid()}_{sec_idx}_{i}.{fmt}")
                         futures[i] = executor.submit(
                             self._generate_export_batch,
-                            batch_text, voice, model, speed, fmt, temp_file
+                            batch_text, voice, model, speed, fmt, temp_file,
+                            provider, api_key
                         )
 
                     for i in range(len(batches)):
@@ -1038,9 +1059,11 @@ class TTSApp:
         self.root.after(0, lambda msg=done_msg: self.status_var.set(msg))
         self.root.after(0, self.reset_export_ui)
 
-    def _generate_export_batch(self, batch_text, voice, model, speed, fmt, temp_file):
+    def _generate_export_batch(self, batch_text, voice, model, speed, fmt, temp_file,
+                               provider, api_key):
         """Generate a single batch for export. Returns the temp file path."""
-        self.generate_tts_audio(batch_text, voice, model, speed, fmt, temp_file)
+        self.generate_tts_audio(batch_text, voice, model, speed, fmt, temp_file,
+                                provider=provider, api_key=api_key)
         return temp_file
 
     def reset_export_ui(self):
@@ -1196,7 +1219,7 @@ class TTSApp:
         # Launch producer coordinator and consumer threads
         threading.Thread(
             target=self.generate_batches_concurrent,
-            args=(api_key, batches, voice, model, speed, total, max_workers),
+            args=(api_key, batches, voice, model, speed, total, max_workers, provider),
             daemon=True
         ).start()
         threading.Thread(
@@ -1205,7 +1228,8 @@ class TTSApp:
             daemon=True
         ).start()
 
-    def generate_single_batch(self, client, batch_index, batch_text, voice, model, speed, total):
+    def generate_single_batch(self, batch_index, batch_text, voice, model, speed, total,
+                              provider, api_key):
         """Worker: generate audio for a single batch. Returns (batch_num, temp_file)."""
         batch_num = batch_index + 1
         self.root.after(0, lambda n=batch_num, chars=len(batch_text): self.log_batch(
@@ -1215,7 +1239,8 @@ class TTSApp:
         temp_dir = tempfile.gettempdir()
         temp_file = os.path.join(temp_dir, f"tts_batch_{os.getpid()}_{batch_index}.mp3")
 
-        self.generate_tts_audio(batch_text, voice, model, speed, "mp3", temp_file)
+        self.generate_tts_audio(batch_text, voice, model, speed, "mp3", temp_file,
+                                provider=provider, api_key=api_key)
 
         self.root.after(0, lambda n=batch_num: self.log_batch(
             f"Batch {n}/{total}: Audio generated, ready to play."
@@ -1223,7 +1248,8 @@ class TTSApp:
 
         return batch_num, temp_file
 
-    def generate_batches_concurrent(self, api_key, batches, voice, model, speed, total, max_workers):
+    def generate_batches_concurrent(self, api_key, batches, voice, model, speed, total,
+                                    max_workers, provider):
         """Coordinator: submit all batches to a thread pool, then feed results to
         the playback queue in order."""
         generated_count = 0
@@ -1236,7 +1262,7 @@ class TTSApp:
                     break
                 future = executor.submit(
                     self.generate_single_batch,
-                    None, i, batch_text, voice, model, speed, total
+                    i, batch_text, voice, model, speed, total, provider, api_key
                 )
                 futures[i] = future
 
