@@ -8,6 +8,7 @@ import queue
 import concurrent.futures
 import re
 import os
+import shutil
 import tempfile
 import docx
 import PyPDF2
@@ -130,6 +131,52 @@ def apply_filters(text, filters):
     return text.strip()
 
 
+def split_text_by_headings(text):
+    """Split text into sections based on detected headings.
+    Returns a list of (heading, body_text) tuples."""
+    heading_pattern = re.compile(
+        r'^('
+        r'(?:Chapter\s+\d+[.:]?\s*.*)'        # Chapter 1: Title
+        r'|(?:Part\s+\w+[.:]?\s*.*)'           # Part One: Title
+        r'|(?:Section\s+\d+[.:]?\s*.*)'         # Section 1: Title
+        r'|(?:\d+(?:\.\d+)*\.?\s+[A-Z].*)'     # 1. Title or 1.2.3 Title
+        r'|(?:[IVXLCDM]+\.\s+.*)'              # IV. Title (Roman numerals)
+        r'|(?:[A-Z][A-Z\s]{2,}[A-Z])$'         # ALL CAPS LINE (min 4 chars)
+        r')',
+        re.MULTILINE
+    )
+
+    matches = list(heading_pattern.finditer(text))
+
+    if not matches:
+        return [("Full Text", text)]
+
+    sections = []
+    for i, match in enumerate(matches):
+        heading = match.group(1).strip()
+        start = match.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        body = text[start:end].strip()
+
+        # Include any text before the first heading as an intro section
+        if i == 0 and match.start() > 0:
+            intro = text[:match.start()].strip()
+            if intro:
+                sections.append(("Introduction", intro))
+
+        if body:
+            sections.append((heading, body))
+
+    return sections if sections else [("Full Text", text)]
+
+
+def sanitize_filename(name, max_len=50):
+    """Create a safe filename from a heading string."""
+    name = re.sub(r'[^\w\s\-]', '', name)
+    name = re.sub(r'\s+', '_', name.strip())
+    return name[:max_len] if name else "untitled"
+
+
 class TTSApp:
     def __init__(self, root):
         self.root = root
@@ -153,6 +200,12 @@ class TTSApp:
         self.stop_requested = False
         self.is_processing = False
         self.batch_temp_files = []
+
+        # Export variables
+        self.export_format_var = tk.StringVar(value="mp3")
+        self.export_split_var = tk.BooleanVar(value=False)
+        self.is_exporting = False
+        self.export_stop_requested = False
 
         # Filter toggle variables
         self.filter_vars = {}
@@ -253,6 +306,11 @@ class TTSApp:
         filters_tab = ttk.Frame(self.notebook, padding="5")
         self.notebook.add(filters_tab, text="Filters")
         self.create_filters_tab(filters_tab)
+
+        # === Tab 3: Export ===
+        export_tab = ttk.Frame(self.notebook, padding="5")
+        self.notebook.add(export_tab, text="Export")
+        self.create_export_tab(export_tab)
 
         # --- Bottom Section: Controls (always visible) ---
         control_frame = ttk.Frame(main_frame)
@@ -419,6 +477,398 @@ class TTSApp:
 
         ttk.Button(btn_frame, text="Use This Text", command=use_filtered).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(btn_frame, text="Close", command=preview_win.destroy).pack(side=tk.LEFT)
+
+    def create_export_tab(self, parent):
+        """Build the Export tab with format selection, heading split, and export controls."""
+        # Description
+        ttk.Label(
+            parent,
+            text="Export the text as audio files. Choose a format, optionally split by headings, "
+                 "and select an output folder.",
+            wraplength=620
+        ).pack(fill=tk.X, pady=(0, 10))
+
+        # --- Export Settings ---
+        settings_frame = ttk.LabelFrame(parent, text="Export Settings", padding="10")
+        settings_frame.pack(fill=tk.X, pady=(0, 10))
+
+        # Format selection
+        format_frame = ttk.Frame(settings_frame)
+        format_frame.pack(fill=tk.X, pady=(0, 5))
+
+        ttk.Label(format_frame, text="Format:").pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Radiobutton(format_frame, text="MP3", variable=self.export_format_var, value="mp3").pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Radiobutton(format_frame, text="WAV", variable=self.export_format_var, value="wav").pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Radiobutton(format_frame, text="FLAC", variable=self.export_format_var, value="flac").pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Radiobutton(format_frame, text="AAC", variable=self.export_format_var, value="aac").pack(side=tk.LEFT)
+
+        # Split by headings option
+        split_frame = ttk.Frame(settings_frame)
+        split_frame.pack(fill=tk.X, pady=(5, 0))
+
+        ttk.Checkbutton(
+            split_frame,
+            text="Split into separate files by headings",
+            variable=self.export_split_var,
+            command=self.on_split_toggle
+        ).pack(side=tk.LEFT)
+
+        ttk.Button(split_frame, text="Detect Headings", command=self.detect_headings).pack(side=tk.RIGHT)
+
+        # --- Heading Preview ---
+        self.heading_frame = ttk.LabelFrame(parent, text="Detected Headings", padding="10")
+        self.heading_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+
+        self.heading_list = tk.Text(self.heading_frame, height=6, wrap=tk.WORD, font=("Segoe UI", 9), state=tk.DISABLED)
+        heading_scroll = ttk.Scrollbar(self.heading_frame, command=self.heading_list.yview)
+        self.heading_list.configure(yscrollcommand=heading_scroll.set)
+        heading_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.heading_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # --- Export Progress ---
+        progress_frame = ttk.LabelFrame(parent, text="Export Progress", padding="10")
+        progress_frame.pack(fill=tk.X, pady=(0, 10))
+
+        self.export_progress_var = tk.StringVar(value="No export in progress.")
+        ttk.Label(progress_frame, textvariable=self.export_progress_var, wraplength=620).pack(fill=tk.X)
+
+        self.export_progress_bar = ttk.Progressbar(progress_frame, mode='determinate')
+        self.export_progress_bar.pack(fill=tk.X, pady=(5, 0))
+
+        self.export_log = tk.Text(progress_frame, height=4, wrap=tk.WORD, font=("Segoe UI", 9), state=tk.DISABLED)
+        export_scroll = ttk.Scrollbar(progress_frame, command=self.export_log.yview)
+        self.export_log.configure(yscrollcommand=export_scroll.set)
+        export_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.export_log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=(5, 0))
+
+        # --- Export Buttons ---
+        btn_frame = ttk.Frame(parent)
+        btn_frame.pack(fill=tk.X)
+
+        self.export_btn = ttk.Button(btn_frame, text="Export Audio", command=self.start_export)
+        self.export_btn.pack(side=tk.LEFT, padx=(0, 5))
+
+        self.export_stop_btn = ttk.Button(btn_frame, text="Cancel Export", command=self.cancel_export, state=tk.DISABLED)
+        self.export_stop_btn.pack(side=tk.LEFT)
+
+    def on_split_toggle(self):
+        """When split by headings is toggled, auto-detect headings."""
+        if self.export_split_var.get():
+            self.detect_headings()
+
+    def detect_headings(self):
+        """Detect headings in the text and show them in the preview list."""
+        text = self.text_area.get(1.0, tk.END).strip()
+        if not text:
+            messagebox.showinfo("No Text", "Load or enter text first.")
+            return
+
+        # Apply filters if any are active
+        active_filters = self.get_active_filters()
+        if active_filters:
+            text = apply_filters(text, active_filters)
+
+        sections = split_text_by_headings(text)
+
+        self.heading_list.config(state=tk.NORMAL)
+        self.heading_list.delete(1.0, tk.END)
+        for i, (heading, body) in enumerate(sections, 1):
+            chars = len(body)
+            batches = len(split_text_into_batches(body))
+            self.heading_list.insert(tk.END, f"{i}. {heading}  ({chars} chars, {batches} batch(es))\n")
+        self.heading_list.config(state=tk.DISABLED)
+
+        self.status_var.set(f"Detected {len(sections)} section(s).")
+
+    def log_export(self, message):
+        """Append a message to the export log."""
+        self.export_log.config(state=tk.NORMAL)
+        self.export_log.insert(tk.END, message + "\n")
+        self.export_log.see(tk.END)
+        self.export_log.config(state=tk.DISABLED)
+
+    def clear_export_log(self):
+        """Clear the export log."""
+        self.export_log.config(state=tk.NORMAL)
+        self.export_log.delete(1.0, tk.END)
+        self.export_log.config(state=tk.DISABLED)
+
+    def cancel_export(self):
+        """Cancel the current export."""
+        self.export_stop_requested = True
+        self.export_stop_btn.config(state=tk.DISABLED)
+        self.log_export("Cancelling export...")
+
+    def start_export(self):
+        """Start exporting audio files."""
+        if self.is_exporting:
+            return
+
+        api_key = self.api_key_var.get().strip()
+        text = self.text_area.get(1.0, tk.END).strip()
+
+        if not api_key:
+            messagebox.showwarning("Missing API Key", "Please enter your OpenAI API key.")
+            return
+        if not text:
+            messagebox.showwarning("Empty Text", "There is no text to export.")
+            return
+
+        # Apply filters
+        active_filters = self.get_active_filters()
+        if active_filters:
+            text = apply_filters(text, active_filters)
+            if not text:
+                messagebox.showwarning("Empty After Filtering", "All text was removed by the active filters.")
+                return
+
+        fmt = self.export_format_var.get()
+        split_by_headings = self.export_split_var.get()
+
+        if split_by_headings:
+            # Export multiple files — ask for a folder
+            output_dir = filedialog.askdirectory(title="Select Export Folder")
+            if not output_dir:
+                return
+            output_path = output_dir
+        else:
+            # Export single file — ask for save path
+            extensions = {
+                "mp3": ("MP3 Files", "*.mp3"),
+                "wav": ("WAV Files", "*.wav"),
+                "flac": ("FLAC Files", "*.flac"),
+                "aac": ("AAC Files", "*.aac"),
+            }
+            ext_label, ext_pattern = extensions[fmt]
+            output_path = filedialog.asksaveasfilename(
+                defaultextension=f".{fmt}",
+                filetypes=[(ext_label, ext_pattern), ("All Files", "*.*")],
+                title="Save Audio File"
+            )
+            if not output_path:
+                return
+
+        # Parse speed
+        speed_str = self.speed_var.get().replace("x", "")
+        try:
+            speed = float(speed_str)
+        except ValueError:
+            speed = 1.0
+
+        # Parse concurrency
+        try:
+            max_workers = int(self.concurrency_var.get())
+        except ValueError:
+            max_workers = 3
+
+        model = self.model_var.get()
+        voice = self.voice_var.get()
+
+        # Prepare sections
+        if split_by_headings:
+            sections = split_text_by_headings(text)
+        else:
+            sections = [("output", text)]
+
+        # Update UI
+        self.clear_export_log()
+        self.is_exporting = True
+        self.export_stop_requested = False
+        self.export_btn.config(state=tk.DISABLED)
+        self.export_stop_btn.config(state=tk.NORMAL)
+
+        total_sections = len(sections)
+        self.export_progress_var.set(f"Exporting {total_sections} section(s) as {fmt.upper()}...")
+        self.export_progress_bar['value'] = 0
+
+        if active_filters:
+            self.log_export(f"Applied {len(active_filters)} filter(s) before export.")
+
+        # Run export in background
+        threading.Thread(
+            target=self.run_export,
+            args=(api_key, sections, voice, model, speed, fmt, output_path,
+                  split_by_headings, max_workers),
+            daemon=True
+        ).start()
+
+    def run_export(self, api_key, sections, voice, model, speed, fmt, output_path,
+                   split_by_headings, max_workers):
+        """Background thread: generate and save audio for each section."""
+        try:
+            client = OpenAI(api_key=api_key)
+        except Exception as e:
+            err_msg = str(e)
+            self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to create client:\n{err_msg}"))
+            self.root.after(0, self.reset_export_ui)
+            return
+
+        total_sections = len(sections)
+
+        # Count total batches across all sections for progress
+        all_batches = []
+        for heading, body in sections:
+            batches = split_text_into_batches(body)
+            all_batches.append((heading, batches))
+
+        total_batches = sum(len(b) for _, b in all_batches)
+        self.root.after(0, lambda: self.export_progress_bar.configure(maximum=total_batches))
+
+        completed_batches = 0
+
+        for sec_idx, (heading, batches) in enumerate(all_batches):
+            if self.export_stop_requested:
+                self.root.after(0, lambda: self.log_export("Export cancelled."))
+                self.root.after(0, self.reset_export_ui)
+                return
+
+            sec_num = sec_idx + 1
+            num_batches = len(batches)
+
+            if split_by_headings:
+                safe_name = sanitize_filename(heading)
+                file_name = f"{sec_num:02d}_{safe_name}.{fmt}"
+                file_path = os.path.join(output_path, file_name)
+            else:
+                file_path = output_path
+
+            self.root.after(0, lambda n=sec_num, h=heading: self.log_export(
+                f"Section {n}/{total_sections}: \"{h}\" ({num_batches} batch(es))"
+            ))
+
+            if num_batches == 1:
+                # Single batch — generate directly to output
+                if self.export_stop_requested:
+                    self.root.after(0, self.reset_export_ui)
+                    return
+
+                try:
+                    response = client.audio.speech.create(
+                        model=model, voice=voice, input=batches[0],
+                        speed=speed, response_format=fmt,
+                    )
+                    response.stream_to_file(file_path)
+                    completed_batches += 1
+                    self.root.after(0, lambda n=completed_batches: self.export_progress_bar.configure(value=n))
+                except AuthenticationError:
+                    self.root.after(0, lambda: messagebox.showerror("Error", "Invalid OpenAI API Key."))
+                    self.root.after(0, self.reset_export_ui)
+                    return
+                except APIConnectionError:
+                    self.root.after(0, lambda: messagebox.showerror("Error", "Network error."))
+                    self.root.after(0, self.reset_export_ui)
+                    return
+                except Exception as e:
+                    err_msg = str(e)
+                    self.root.after(0, lambda msg=err_msg: messagebox.showerror("Error", f"Export failed:\n{msg}"))
+                    self.root.after(0, self.reset_export_ui)
+                    return
+            else:
+                # Multiple batches — generate concurrently, then concatenate
+                temp_files = []
+                error_occurred = False
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {}
+                    for i, batch_text in enumerate(batches):
+                        if self.export_stop_requested:
+                            break
+                        temp_file = os.path.join(tempfile.gettempdir(), f"export_{os.getpid()}_{sec_idx}_{i}.{fmt}")
+                        futures[i] = executor.submit(
+                            self._generate_export_batch,
+                            client, batch_text, voice, model, speed, fmt, temp_file
+                        )
+
+                    for i in range(len(batches)):
+                        if self.export_stop_requested:
+                            for f in futures.values():
+                                f.cancel()
+                            self.root.after(0, lambda: self.log_export("Export cancelled."))
+                            self.root.after(0, self.reset_export_ui)
+                            return
+
+                        if i not in futures:
+                            break
+
+                        try:
+                            temp_file = futures[i].result()
+                            temp_files.append(temp_file)
+                            completed_batches += 1
+                            self.root.after(0, lambda n=completed_batches: self.export_progress_bar.configure(value=n))
+                        except AuthenticationError:
+                            self.root.after(0, lambda: messagebox.showerror("Error", "Invalid OpenAI API Key."))
+                            error_occurred = True
+                            break
+                        except APIConnectionError:
+                            self.root.after(0, lambda: messagebox.showerror("Error", "Network error."))
+                            error_occurred = True
+                            break
+                        except Exception as e:
+                            err_msg = str(e)
+                            self.root.after(0, lambda msg=err_msg: messagebox.showerror("Error", f"Export error:\n{msg}"))
+                            error_occurred = True
+                            break
+
+                if error_occurred:
+                    # Clean up temp files
+                    for f in temp_files:
+                        try:
+                            os.remove(f)
+                        except OSError:
+                            pass
+                    self.root.after(0, self.reset_export_ui)
+                    return
+
+                # Concatenate batch files into the final output
+                try:
+                    with open(file_path, 'wb') as outfile:
+                        for tf in temp_files:
+                            with open(tf, 'rb') as infile:
+                                shutil.copyfileobj(infile, outfile)
+                except Exception as e:
+                    err_msg = str(e)
+                    self.root.after(0, lambda msg=err_msg: messagebox.showerror("Error", f"Failed to save file:\n{msg}"))
+                    self.root.after(0, self.reset_export_ui)
+                    return
+                finally:
+                    for f in temp_files:
+                        try:
+                            os.remove(f)
+                        except OSError:
+                            pass
+
+            self.root.after(0, lambda n=sec_num, p=file_path: self.log_export(
+                f"  Saved: {os.path.basename(p)}"
+            ))
+            self.root.after(0, lambda n=sec_num: self.export_progress_var.set(
+                f"Exported {n}/{total_sections} section(s)..."
+            ))
+
+        # Done
+        if split_by_headings:
+            done_msg = f"Exported {total_sections} file(s) to {output_path}"
+        else:
+            done_msg = f"Exported to {os.path.basename(output_path)}"
+
+        self.root.after(0, lambda: self.export_progress_var.set("Export complete."))
+        self.root.after(0, lambda msg=done_msg: self.log_export(msg))
+        self.root.after(0, lambda msg=done_msg: self.status_var.set(msg))
+        self.root.after(0, self.reset_export_ui)
+
+    def _generate_export_batch(self, client, batch_text, voice, model, speed, fmt, temp_file):
+        """Generate a single batch for export. Returns the temp file path."""
+        response = client.audio.speech.create(
+            model=model, voice=voice, input=batch_text,
+            speed=speed, response_format=fmt,
+        )
+        response.stream_to_file(temp_file)
+        return temp_file
+
+    def reset_export_ui(self):
+        """Re-enable export buttons after export completes or fails."""
+        self.export_btn.config(state=tk.NORMAL)
+        self.export_stop_btn.config(state=tk.DISABLED)
+        self.is_exporting = False
 
     def log_batch(self, message):
         """Append a message to the batch log box."""
