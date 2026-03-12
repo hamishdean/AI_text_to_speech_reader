@@ -4,6 +4,7 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import threading
+import queue
 import os
 import tempfile
 import docx
@@ -263,34 +264,38 @@ class TTSApp:
         model = self.model_var.get()
         voice = self.voice_var.get()
 
-        # Run batch processing in background thread
+        # Queue for producer (generator) -> consumer (player) communication
+        # Items are (batch_num, temp_file) tuples, or None as a sentinel for "done"
+        self.audio_queue = queue.Queue()
+        self.generator_error = None
+
+        # Launch producer and consumer threads
         threading.Thread(
-            target=self.process_batches,
-            args=(api_key, batches, voice, model, speed),
+            target=self.generate_batches,
+            args=(api_key, batches, voice, model, speed, total),
+            daemon=True
+        ).start()
+        threading.Thread(
+            target=self.play_batches,
+            args=(total,),
             daemon=True
         ).start()
 
-    def process_batches(self, api_key, batches, voice, model, speed):
-        """Generate and play audio for each batch sequentially."""
-        total = len(batches)
-        self.batch_temp_files = []
-
+    def generate_batches(self, api_key, batches, voice, model, speed, total):
+        """Producer: generate audio files via OpenAI API and enqueue them."""
         try:
             client = OpenAI(api_key=api_key)
         except Exception as e:
-            err_msg = str(e)
-            self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to create client:\n{err_msg}"))
-            self.root.after(0, self.reset_ui)
+            self.generator_error = f"Failed to create client:\n{str(e)}"
+            self.audio_queue.put(None)
             return
 
         for i, batch_text in enumerate(batches):
             if self.stop_requested:
-                self.root.after(0, lambda: self.log_batch("Batch processing stopped."))
-                self.root.after(0, self.reset_ui)
+                self.audio_queue.put(None)
                 return
 
             batch_num = i + 1
-            self.root.after(0, lambda n=batch_num: self.status_var.set(f"Generating batch {n}/{total}..."))
             self.root.after(0, lambda n=batch_num, chars=len(batch_text): self.log_batch(
                 f"Batch {n}/{total}: Generating audio ({chars} chars)..."
             ))
@@ -308,27 +313,60 @@ class TTSApp:
                 )
                 response.stream_to_file(temp_file)
 
-                self.root.after(0, lambda n=batch_num: self.log_batch(f"Batch {n}/{total}: Audio generated."))
-                self.root.after(0, lambda n=batch_num: self.progress_bar.configure(value=n))
-                self.root.after(0, lambda n=batch_num: self.batch_progress_var.set(
-                    f"Playing batch {n}/{total}..."
+                self.root.after(0, lambda n=batch_num: self.log_batch(
+                    f"Batch {n}/{total}: Audio generated, ready to play."
                 ))
+                self.root.after(0, lambda n=batch_num: self.progress_bar.configure(value=n))
 
             except AuthenticationError:
-                self.root.after(0, lambda: messagebox.showerror("Error", "Invalid OpenAI API Key."))
-                self.root.after(0, self.reset_ui)
+                self.generator_error = "Invalid OpenAI API Key."
+                self.audio_queue.put(None)
                 return
             except APIConnectionError:
-                self.root.after(0, lambda: messagebox.showerror("Error", "Network error. Please check your connection."))
-                self.root.after(0, self.reset_ui)
+                self.generator_error = "Network error. Please check your connection."
+                self.audio_queue.put(None)
                 return
             except Exception as e:
-                err_msg = f"Error on batch {batch_num}:\n{str(e)}"
-                self.root.after(0, lambda msg=err_msg: messagebox.showerror("Error", msg))
+                self.generator_error = f"Error on batch {batch_num}:\n{str(e)}"
+                self.audio_queue.put(None)
+                return
+
+            # Enqueue the ready file for the player thread
+            self.audio_queue.put((batch_num, temp_file))
+
+        # Signal that all batches have been generated
+        self.audio_queue.put(None)
+
+    def play_batches(self, total):
+        """Consumer: play audio files from the queue as they become available."""
+        while True:
+            if self.stop_requested:
+                self.root.after(0, lambda: self.log_batch("Playback stopped."))
                 self.root.after(0, self.reset_ui)
                 return
 
-            # Play this batch and wait for it to finish before processing next
+            # Wait for next item (blocks until producer puts something)
+            try:
+                item = self.audio_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            # None sentinel means producer is done (either finished or errored)
+            if item is None:
+                if self.generator_error:
+                    err_msg = self.generator_error
+                    self.root.after(0, lambda msg=err_msg: messagebox.showerror("Error", msg))
+                    self.root.after(0, self.reset_ui)
+                else:
+                    # All batches generated and played
+                    self.root.after(0, lambda: self.status_var.set("Ready."))
+                    self.root.after(0, lambda: self.batch_progress_var.set(f"All {total} batch(es) completed."))
+                    self.root.after(0, lambda: self.log_batch("All batches finished."))
+                    self.root.after(0, self.reset_ui)
+                return
+
+            batch_num, temp_file = item
+
             if self.stop_requested:
                 self.root.after(0, self.reset_ui)
                 return
@@ -337,6 +375,9 @@ class TTSApp:
                 pygame.mixer.music.load(temp_file)
                 pygame.mixer.music.play()
                 self.root.after(0, lambda n=batch_num: self.status_var.set(f"Playing batch {n}/{total}..."))
+                self.root.after(0, lambda n=batch_num: self.batch_progress_var.set(
+                    f"Playing batch {n}/{total}..."
+                ))
 
                 # Wait for playback to complete
                 while pygame.mixer.music.get_busy():
@@ -353,13 +394,6 @@ class TTSApp:
                 return
 
             self.root.after(0, lambda n=batch_num: self.log_batch(f"Batch {n}/{total}: Playback complete."))
-
-        # All batches done
-        self.root.after(0, lambda: self.status_var.set("Ready."))
-        self.root.after(0, lambda: self.batch_progress_var.set(f"All {total} batch(es) completed."))
-        self.root.after(0, lambda: self.log_batch("All batches finished."))
-        self.root.after(0, self.reset_ui)
-        self.cleanup_temp_files()
 
     def cleanup_temp_files(self):
         """Unload pygame music and remove temporary audio files."""
