@@ -10,9 +10,11 @@ import re
 import os
 import shutil
 import tempfile
+import json
 import docx
 import PyPDF2
 import pygame
+import requests
 from openai import OpenAI, AuthenticationError, APIConnectionError
 
 # Maximum characters per TTS API request
@@ -180,7 +182,7 @@ def sanitize_filename(name, max_len=50):
 class TTSApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("OpenAI Text-to-Speech Reader")
+        self.root.title("AI Text-to-Speech Reader")
         self.root.geometry("700x750")
         self.root.minsize(500, 550)
 
@@ -188,13 +190,30 @@ class TTSApp:
         pygame.mixer.init()
 
         # Variables
+        self.provider_var = tk.StringVar(value="OpenAI")
         self.api_key_var = tk.StringVar()
+        self.elevenlabs_api_key_var = tk.StringVar()
         self.voice_var = tk.StringVar(value="alloy")
         self.model_var = tk.StringVar(value="tts-1")
         self.speed_var = tk.StringVar(value="1.0x")
         self.concurrency_var = tk.StringVar(value="3")
-        self.voices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
-        self.models = ["tts-1", "tts-1-hd"]
+
+        # OpenAI options
+        self.openai_voices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
+        self.openai_models = ["tts-1", "tts-1-hd"]
+
+        # ElevenLabs options
+        self.elevenlabs_voices = {}  # {display_name: voice_id}
+        self.elevenlabs_voice_names = ["(Fetch voices first)"]
+        self.elevenlabs_models = [
+            "eleven_multilingual_v2",
+            "eleven_turbo_v2_5",
+            "eleven_monolingual_v1",
+            "eleven_flash_v2_5",
+        ]
+
+        self.voices = self.openai_voices
+        self.models = self.openai_models
         self.speeds = ["1.0x", "1.25x", "1.5x", "1.75x", "2.0x", "2.5x", "3.0x", "4.0x"]
         self.concurrency_options = ["1", "2", "3", "4", "5"]
         self.stop_requested = False
@@ -238,25 +257,44 @@ class TTSApp:
         settings_frame = ttk.LabelFrame(main_frame, text="Settings", padding="10")
         settings_frame.pack(fill=tk.X, pady=(0, 10))
 
-        ttk.Label(settings_frame, text="OpenAI API Key:").grid(row=0, column=0, sticky=tk.W, pady=5)
-        api_entry = ttk.Entry(settings_frame, textvariable=self.api_key_var, show="*", width=50)
-        api_entry.grid(row=0, column=1, columnspan=3, sticky=tk.EW, padx=5, pady=5)
+        # Provider selection
+        ttk.Label(settings_frame, text="Provider:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        provider_dropdown = ttk.Combobox(
+            settings_frame, textvariable=self.provider_var,
+            values=["OpenAI", "ElevenLabs"], state="readonly", width=15
+        )
+        provider_dropdown.grid(row=0, column=1, sticky=tk.W, padx=5, pady=5)
+        provider_dropdown.bind("<<ComboboxSelected>>", self.on_provider_change)
 
-        ttk.Label(settings_frame, text="Voice:").grid(row=1, column=0, sticky=tk.W, pady=5)
-        voice_dropdown = ttk.Combobox(settings_frame, textvariable=self.voice_var, values=self.voices, state="readonly", width=15)
-        voice_dropdown.grid(row=1, column=1, sticky=tk.W, padx=5, pady=5)
+        # OpenAI API Key
+        self.openai_key_label = ttk.Label(settings_frame, text="OpenAI API Key:")
+        self.openai_key_label.grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.openai_key_entry = ttk.Entry(settings_frame, textvariable=self.api_key_var, show="*", width=50)
+        self.openai_key_entry.grid(row=1, column=1, columnspan=3, sticky=tk.EW, padx=5, pady=5)
 
-        ttk.Label(settings_frame, text="Model:").grid(row=1, column=2, sticky=tk.W, padx=(15, 0), pady=5)
-        model_dropdown = ttk.Combobox(settings_frame, textvariable=self.model_var, values=self.models, state="readonly", width=10)
-        model_dropdown.grid(row=1, column=3, sticky=tk.W, padx=5, pady=5)
+        # ElevenLabs API Key (hidden by default)
+        self.elevenlabs_key_label = ttk.Label(settings_frame, text="ElevenLabs API Key:")
+        self.elevenlabs_key_entry = ttk.Entry(settings_frame, textvariable=self.elevenlabs_api_key_var, show="*", width=40)
+        self.fetch_voices_btn = ttk.Button(settings_frame, text="Fetch Voices", command=self.fetch_elevenlabs_voices)
 
-        ttk.Label(settings_frame, text="Speed:").grid(row=2, column=0, sticky=tk.W, pady=5)
-        speed_dropdown = ttk.Combobox(settings_frame, textvariable=self.speed_var, values=self.speeds, state="readonly", width=10)
-        speed_dropdown.grid(row=2, column=1, sticky=tk.W, padx=5, pady=5)
+        # Voice / Model row
+        ttk.Label(settings_frame, text="Voice:").grid(row=3, column=0, sticky=tk.W, pady=5)
+        self.voice_dropdown = ttk.Combobox(settings_frame, textvariable=self.voice_var, values=self.voices, state="readonly", width=25)
+        self.voice_dropdown.grid(row=3, column=1, sticky=tk.W, padx=5, pady=5)
 
-        ttk.Label(settings_frame, text="Parallel:").grid(row=2, column=2, sticky=tk.W, padx=(15, 0), pady=5)
+        ttk.Label(settings_frame, text="Model:").grid(row=3, column=2, sticky=tk.W, padx=(15, 0), pady=5)
+        self.model_dropdown = ttk.Combobox(settings_frame, textvariable=self.model_var, values=self.models, state="readonly", width=22)
+        self.model_dropdown.grid(row=3, column=3, sticky=tk.W, padx=5, pady=5)
+
+        # Speed / Parallel row
+        self.speed_label = ttk.Label(settings_frame, text="Speed:")
+        self.speed_label.grid(row=4, column=0, sticky=tk.W, pady=5)
+        self.speed_dropdown = ttk.Combobox(settings_frame, textvariable=self.speed_var, values=self.speeds, state="readonly", width=10)
+        self.speed_dropdown.grid(row=4, column=1, sticky=tk.W, padx=5, pady=5)
+
+        ttk.Label(settings_frame, text="Parallel:").grid(row=4, column=2, sticky=tk.W, padx=(15, 0), pady=5)
         concurrency_dropdown = ttk.Combobox(settings_frame, textvariable=self.concurrency_var, values=self.concurrency_options, state="readonly", width=5)
-        concurrency_dropdown.grid(row=2, column=3, sticky=tk.W, padx=5, pady=5)
+        concurrency_dropdown.grid(row=4, column=3, sticky=tk.W, padx=5, pady=5)
 
         settings_frame.columnconfigure(1, weight=1)
 
@@ -325,6 +363,165 @@ class TTSApp:
         self.status_var = tk.StringVar(value="Ready.")
         status_label = ttk.Label(control_frame, textvariable=self.status_var, foreground="gray")
         status_label.pack(side=tk.RIGHT)
+
+    def on_provider_change(self, event=None):
+        """Update UI when the TTS provider is changed."""
+        provider = self.provider_var.get()
+
+        if provider == "OpenAI":
+            # Show OpenAI key, hide ElevenLabs key
+            self.openai_key_label.grid(row=1, column=0, sticky=tk.W, pady=5)
+            self.openai_key_entry.grid(row=1, column=1, columnspan=3, sticky=tk.EW, padx=5, pady=5)
+            self.elevenlabs_key_label.grid_forget()
+            self.elevenlabs_key_entry.grid_forget()
+            self.fetch_voices_btn.grid_forget()
+
+            # Update voice and model lists
+            self.voices = self.openai_voices
+            self.models = self.openai_models
+            self.voice_dropdown.config(values=self.voices)
+            self.model_dropdown.config(values=self.models)
+            if self.voice_var.get() not in self.voices:
+                self.voice_var.set(self.voices[0])
+            self.model_var.set(self.models[0])
+
+            # Show speed (OpenAI supports it)
+            self.speed_label.grid(row=4, column=0, sticky=tk.W, pady=5)
+            self.speed_dropdown.grid(row=4, column=1, sticky=tk.W, padx=5, pady=5)
+
+        elif provider == "ElevenLabs":
+            # Hide OpenAI key, show ElevenLabs key
+            self.openai_key_label.grid_forget()
+            self.openai_key_entry.grid_forget()
+            self.elevenlabs_key_label.grid(row=1, column=0, sticky=tk.W, pady=5)
+            self.elevenlabs_key_entry.grid(row=1, column=1, columnspan=2, sticky=tk.EW, padx=5, pady=5)
+            self.fetch_voices_btn.grid(row=1, column=3, sticky=tk.W, padx=5, pady=5)
+
+            # Update voice and model lists
+            self.voices = self.elevenlabs_voice_names
+            self.models = self.elevenlabs_models
+            self.voice_dropdown.config(values=self.voices)
+            self.model_dropdown.config(values=self.models)
+            if self.voice_var.get() not in self.voices:
+                self.voice_var.set(self.voices[0])
+            self.model_var.set(self.models[0])
+
+            # Hide speed (ElevenLabs doesn't support speed param the same way)
+            self.speed_label.grid_forget()
+            self.speed_dropdown.grid_forget()
+
+    def fetch_elevenlabs_voices(self):
+        """Fetch available voices from the ElevenLabs API."""
+        api_key = self.elevenlabs_api_key_var.get().strip()
+        if not api_key:
+            messagebox.showwarning("Missing API Key", "Please enter your ElevenLabs API key.")
+            return
+
+        self.status_var.set("Fetching ElevenLabs voices...")
+        self.root.update()
+
+        def do_fetch():
+            try:
+                resp = requests.get(
+                    "https://api.elevenlabs.io/v1/voices",
+                    headers={"xi-api-key": api_key},
+                    timeout=15,
+                )
+                if resp.status_code == 401:
+                    self.root.after(0, lambda: messagebox.showerror("Error", "Invalid ElevenLabs API key."))
+                    self.root.after(0, lambda: self.status_var.set("Ready."))
+                    return
+                resp.raise_for_status()
+                data = resp.json()
+                voices = data.get("voices", [])
+
+                self.elevenlabs_voices = {}
+                for v in voices:
+                    name = v.get("name", "Unknown")
+                    vid = v.get("voice_id", "")
+                    category = v.get("category", "")
+                    display = f"{name} ({category})" if category else name
+                    self.elevenlabs_voices[display] = vid
+
+                self.elevenlabs_voice_names = sorted(self.elevenlabs_voices.keys())
+
+                def update_ui():
+                    self.voices = self.elevenlabs_voice_names
+                    self.voice_dropdown.config(values=self.voices)
+                    if self.voices:
+                        self.voice_var.set(self.voices[0])
+                    self.status_var.set(f"Loaded {len(self.voices)} ElevenLabs voice(s).")
+
+                self.root.after(0, update_ui)
+
+            except requests.exceptions.ConnectionError:
+                self.root.after(0, lambda: messagebox.showerror("Error", "Network error. Check your connection."))
+                self.root.after(0, lambda: self.status_var.set("Ready."))
+            except Exception as e:
+                err = str(e)
+                self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to fetch voices:\n{err}"))
+                self.root.after(0, lambda: self.status_var.set("Ready."))
+
+        threading.Thread(target=do_fetch, daemon=True).start()
+
+    def generate_tts_audio(self, text, voice, model, speed, response_format, output_path):
+        """Generate TTS audio using the currently selected provider.
+        Returns the output file path on success."""
+        provider = self.provider_var.get()
+
+        if provider == "OpenAI":
+            api_key = self.api_key_var.get().strip()
+            client = OpenAI(api_key=api_key)
+            response = client.audio.speech.create(
+                model=model,
+                voice=voice,
+                input=text,
+                speed=speed,
+                response_format=response_format,
+            )
+            response.stream_to_file(output_path)
+
+        elif provider == "ElevenLabs":
+            api_key = self.elevenlabs_api_key_var.get().strip()
+            voice_id = self.elevenlabs_voices.get(voice, voice)
+
+            resp = requests.post(
+                f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+                headers={
+                    "xi-api-key": api_key,
+                    "Content-Type": "application/json",
+                    "Accept": "audio/mpeg",
+                },
+                json={
+                    "text": text,
+                    "model_id": model,
+                    "voice_settings": {
+                        "stability": 0.5,
+                        "similarity_boost": 0.75,
+                    },
+                },
+                timeout=120,
+            )
+
+            if resp.status_code == 401:
+                raise AuthenticationError(
+                    message="Invalid ElevenLabs API key.",
+                    response=None,
+                    body=None,
+                )
+            if resp.status_code != 200:
+                raise Exception(f"ElevenLabs API error ({resp.status_code}): {resp.text[:200]}")
+
+            with open(output_path, 'wb') as f:
+                f.write(resp.content)
+
+        return output_path
+
+    def get_current_api_key(self):
+        """Return the API key for the active provider."""
+        if self.provider_var.get() == "ElevenLabs":
+            return self.elevenlabs_api_key_var.get().strip()
+        return self.api_key_var.get().strip()
 
     def create_filters_tab(self, parent):
         """Build the Filters tab with checkbuttons and action buttons."""
@@ -604,11 +801,12 @@ class TTSApp:
         if self.is_exporting:
             return
 
-        api_key = self.api_key_var.get().strip()
+        api_key = self.get_current_api_key()
         text = self.text_area.get(1.0, tk.END).strip()
 
+        provider = self.provider_var.get()
         if not api_key:
-            messagebox.showwarning("Missing API Key", "Please enter your OpenAI API key.")
+            messagebox.showwarning("Missing API Key", f"Please enter your {provider} API key.")
             return
         if not text:
             messagebox.showwarning("Empty Text", "There is no text to export.")
@@ -695,14 +893,6 @@ class TTSApp:
     def run_export(self, api_key, sections, voice, model, speed, fmt, output_path,
                    split_by_headings, max_workers):
         """Background thread: generate and save audio for each section."""
-        try:
-            client = OpenAI(api_key=api_key)
-        except Exception as e:
-            err_msg = str(e)
-            self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to create client:\n{err_msg}"))
-            self.root.after(0, self.reset_export_ui)
-            return
-
         total_sections = len(sections)
 
         # Count total batches across all sections for progress
@@ -743,11 +933,7 @@ class TTSApp:
                     return
 
                 try:
-                    response = client.audio.speech.create(
-                        model=model, voice=voice, input=batches[0],
-                        speed=speed, response_format=fmt,
-                    )
-                    response.stream_to_file(file_path)
+                    self.generate_tts_audio(batches[0], voice, model, speed, fmt, file_path)
                     completed_batches += 1
                     self.root.after(0, lambda n=completed_batches: self.export_progress_bar.configure(value=n))
                 except AuthenticationError:
@@ -776,7 +962,7 @@ class TTSApp:
                         temp_file = os.path.join(tempfile.gettempdir(), f"export_{os.getpid()}_{sec_idx}_{i}.{fmt}")
                         futures[i] = executor.submit(
                             self._generate_export_batch,
-                            client, batch_text, voice, model, speed, fmt, temp_file
+                            batch_text, voice, model, speed, fmt, temp_file
                         )
 
                     for i in range(len(batches)):
@@ -855,13 +1041,9 @@ class TTSApp:
         self.root.after(0, lambda msg=done_msg: self.status_var.set(msg))
         self.root.after(0, self.reset_export_ui)
 
-    def _generate_export_batch(self, client, batch_text, voice, model, speed, fmt, temp_file):
+    def _generate_export_batch(self, batch_text, voice, model, speed, fmt, temp_file):
         """Generate a single batch for export. Returns the temp file path."""
-        response = client.audio.speech.create(
-            model=model, voice=voice, input=batch_text,
-            speed=speed, response_format=fmt,
-        )
-        response.stream_to_file(temp_file)
+        self.generate_tts_audio(batch_text, voice, model, speed, fmt, temp_file)
         return temp_file
 
     def reset_export_ui(self):
@@ -944,11 +1126,12 @@ class TTSApp:
         if self.is_processing:
             return
 
-        api_key = self.api_key_var.get().strip()
+        api_key = self.get_current_api_key()
         text = self.text_area.get(1.0, tk.END).strip()
 
+        provider = self.provider_var.get()
         if not api_key:
-            messagebox.showwarning("Missing API Key", "Please enter your OpenAI API key.")
+            messagebox.showwarning("Missing API Key", f"Please enter your {provider} API key.")
             return
         if not text:
             messagebox.showwarning("Empty Text", "There is no text to read.")
@@ -1035,13 +1218,7 @@ class TTSApp:
         temp_dir = tempfile.gettempdir()
         temp_file = os.path.join(temp_dir, f"tts_batch_{os.getpid()}_{batch_index}.mp3")
 
-        response = client.audio.speech.create(
-            model=model,
-            voice=voice,
-            input=batch_text,
-            speed=speed,
-        )
-        response.stream_to_file(temp_file)
+        self.generate_tts_audio(batch_text, voice, model, speed, "mp3", temp_file)
 
         self.root.after(0, lambda n=batch_num: self.log_batch(
             f"Batch {n}/{total}: Audio generated, ready to play."
@@ -1052,13 +1229,6 @@ class TTSApp:
     def generate_batches_concurrent(self, api_key, batches, voice, model, speed, total, max_workers):
         """Coordinator: submit all batches to a thread pool, then feed results to
         the playback queue in order."""
-        try:
-            client = OpenAI(api_key=api_key)
-        except Exception as e:
-            self.generator_error = f"Failed to create client:\n{str(e)}"
-            self.audio_queue.put(None)
-            return
-
         generated_count = 0
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -1069,7 +1239,7 @@ class TTSApp:
                     break
                 future = executor.submit(
                     self.generate_single_batch,
-                    client, i, batch_text, voice, model, speed, total
+                    None, i, batch_text, voice, model, speed, total
                 )
                 futures[i] = future
 
