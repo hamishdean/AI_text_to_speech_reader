@@ -1,16 +1,18 @@
-# OpenAI Text-to-Speech Reader
+# AI Text-to-Speech Reader
 
-A desktop application that converts text to speech using the OpenAI TTS API. Load PDFs or Word documents, apply text filters, and listen to or export audio in multiple formats.
+A desktop application that converts text to speech using **OpenAI** or **ElevenLabs** TTS APIs. Load PDFs or Word documents, apply text filters, and listen to or export audio in multiple formats.
 
 ![Python](https://img.shields.io/badge/Python-3.8+-blue) ![License](https://img.shields.io/badge/License-MIT-green)
 
 ## Features
 
+### Multi-Provider Support
+- **OpenAI TTS** — 6 built-in voices (alloy, echo, fable, onyx, nova, shimmer), `tts-1` and `tts-1-hd` models, adjustable speed (1.0x-4.0x)
+- **ElevenLabs TTS** — Access your full ElevenLabs voice library (premade + cloned voices), multiple models including `eleven_multilingual_v2` and `eleven_turbo_v2_5`
+- Switch between providers with a single dropdown — voice and model lists update automatically
+
 ### Reader
 - **Load PDF and DOCX** files or paste text directly
-- **Voice selection** from 6 OpenAI voices: alloy, echo, fable, onyx, nova, shimmer
-- **Model choice**: `tts-1` (fast) or `tts-1-hd` (higher quality)
-- **Playback speed**: 1.0x to 4.0x
 - **Batch processing** — text of any length is automatically split into chunks at sentence boundaries and processed through the API
 - **Concurrent generation** — configurable parallelism (1-5 threads) generates upcoming batches while current audio plays
 - **Stop button** halts playback and cancels remaining batches
@@ -50,7 +52,7 @@ Toggle filters to clean up text before sending to the TTS API:
 ## Requirements
 
 - Python 3.8+
-- An [OpenAI API key](https://platform.openai.com/api-keys)
+- An [OpenAI API key](https://platform.openai.com/api-keys) and/or an [ElevenLabs API key](https://elevenlabs.io/app/settings/api-keys)
 
 ### Python Dependencies
 
@@ -59,12 +61,13 @@ openai
 pygame
 PyPDF2
 python-docx
+requests
 ```
 
 Install with:
 
 ```bash
-pip install openai pygame PyPDF2 python-docx
+pip install openai pygame PyPDF2 python-docx requests
 ```
 
 `tkinter` is included with most Python installations. If missing on Linux:
@@ -83,15 +86,17 @@ sudo dnf install python3-tkinter
 python openai_text_to_speech_reader.py
 ```
 
-1. Enter your OpenAI API key in the Settings panel
-2. Load a PDF/DOCX or type/paste text into the text area
-3. Select voice, model, speed, and parallel threads
-4. (Optional) Go to the **Filters** tab to enable text cleanup
-5. Click **Read Aloud** to listen, or go to the **Export** tab to save audio files
+1. Select a **Provider** (OpenAI or ElevenLabs) in the Settings panel
+2. Enter the corresponding API key
+   - For ElevenLabs, click **Fetch Voices** to load your available voices
+3. Load a PDF/DOCX or type/paste text into the text area
+4. Select voice, model, speed (OpenAI only), and parallel threads
+5. (Optional) Go to the **Filters** tab to enable text cleanup
+6. Click **Read Aloud** to listen, or go to the **Export** tab to save audio files
 
 ## How Batch Processing Works
 
-The OpenAI TTS API has a ~4096 character limit per request. This app handles text of any length by:
+TTS APIs have character limits per request (~4096 for OpenAI, ~5000 for ElevenLabs). This app handles text of any length by:
 
 1. Splitting text into ~4000 character chunks at sentence boundaries
 2. Submitting multiple chunks concurrently via a thread pool
