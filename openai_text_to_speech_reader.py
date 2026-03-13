@@ -10,7 +10,6 @@ import re
 import os
 import shutil
 import tempfile
-import json
 import docx
 import PyPDF2
 import pygame
@@ -255,6 +254,45 @@ class TTSApp:
 
         self.create_widgets()
 
+    def _create_scrollable_tab(self, notebook, tab_text):
+        """Create a notebook tab whose content scrolls vertically on small screens.
+        Returns (inner_frame, bind_scroll_fn).
+        Pack widgets into inner_frame.  Call bind_scroll_fn(widget) on any child
+        widgets that might intercept mouse-wheel events (frames, labels)."""
+        outer = ttk.Frame(notebook)
+        notebook.add(outer, text=tab_text)
+
+        canvas = tk.Canvas(outer, highlightthickness=0, borderwidth=0)
+        v_scroll = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=canvas.yview)
+        inner = ttk.Frame(canvas, padding="5")
+
+        inner_id = canvas.create_window((0, 0), window=inner, anchor=tk.NW)
+        canvas.configure(yscrollcommand=v_scroll.set)
+
+        def _on_frame_cfg(event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_cfg(event):
+            canvas.itemconfig(inner_id, width=event.width)
+
+        inner.bind("<Configure>", _on_frame_cfg)
+        canvas.bind("<Configure>", _on_canvas_cfg)
+
+        v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Mouse-wheel helper — call on any child that might eat scroll events
+        def bind_scroll(widget):
+            widget.bind("<MouseWheel>",
+                        lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+            widget.bind("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
+            widget.bind("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
+
+        bind_scroll(canvas)
+        bind_scroll(inner)
+
+        return inner, bind_scroll
+
     def create_widgets(self):
         # Main Frame
         main_frame = ttk.Frame(self.root, padding="10")
@@ -315,34 +353,41 @@ class TTSApp:
         self.notebook = ttk.Notebook(main_frame)
         self.notebook.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
 
-        # === Tab 1: Reader ===
-        reader_tab = ttk.Frame(self.notebook, padding="5")
-        self.notebook.add(reader_tab, text="Reader")
+        # === Tab 1: Reader (scrollable) ===
+        reader_inner, reader_scroll = self._create_scrollable_tab(self.notebook, "Reader")
 
         # Text Content
-        text_frame = ttk.LabelFrame(reader_tab, text="Text Content", padding="10")
-        text_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        text_frame = ttk.LabelFrame(reader_inner, text="Text Content", padding="10")
+        text_frame.pack(fill=tk.X, pady=(0, 10))
+        reader_scroll(text_frame)
 
         toolbar = ttk.Frame(text_frame)
         toolbar.pack(fill=tk.X, pady=(0, 5))
+        reader_scroll(toolbar)
 
         ttk.Button(toolbar, text="Load PDF", command=self.load_pdf).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(toolbar, text="Load DOCX", command=self.load_docx).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(toolbar, text="Clear Text", command=self.clear_text).pack(side=tk.LEFT)
 
-        self.text_area = tk.Text(text_frame, wrap=tk.WORD, font=("Segoe UI", 10))
-        scrollbar = ttk.Scrollbar(text_frame, command=self.text_area.yview)
+        # Text area with its own scrollbar (fixed height so tab canvas can scroll)
+        text_container = ttk.Frame(text_frame)
+        text_container.pack(fill=tk.X, pady=(0, 0))
+
+        self.text_area = tk.Text(text_container, wrap=tk.WORD, font=("Segoe UI", 10), height=14)
+        scrollbar = ttk.Scrollbar(text_container, command=self.text_area.yview)
         self.text_area.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.text_area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         # Batch Progress
-        batch_frame = ttk.LabelFrame(reader_tab, text="Batch Progress", padding="10")
+        batch_frame = ttk.LabelFrame(reader_inner, text="Batch Progress", padding="10")
         batch_frame.pack(fill=tk.X, pady=(0, 5))
+        reader_scroll(batch_frame)
 
         self.batch_progress_var = tk.StringVar(value="No batches to process.")
         self.batch_progress_label = ttk.Label(batch_frame, textvariable=self.batch_progress_var, wraplength=620)
         self.batch_progress_label.pack(fill=tk.X)
+        reader_scroll(self.batch_progress_label)
 
         self.progress_bar = ttk.Progressbar(batch_frame, mode='determinate')
         self.progress_bar.pack(fill=tk.X, pady=(5, 0))
@@ -353,17 +398,15 @@ class TTSApp:
         batch_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.batch_log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=(5, 0))
 
-        # === Tab 2: Filters ===
-        filters_tab = ttk.Frame(self.notebook, padding="5")
-        self.notebook.add(filters_tab, text="Filters")
-        self.create_filters_tab(filters_tab)
+        # === Tab 2: Filters (scrollable) ===
+        filters_inner, filters_scroll = self._create_scrollable_tab(self.notebook, "Filters")
+        self.create_filters_tab(filters_inner, filters_scroll)
 
-        # === Tab 3: Export ===
-        export_tab = ttk.Frame(self.notebook, padding="5")
-        self.notebook.add(export_tab, text="Export")
-        self.create_export_tab(export_tab)
+        # === Tab 3: Export (scrollable) ===
+        export_inner, export_scroll = self._create_scrollable_tab(self.notebook, "Export")
+        self.create_export_tab(export_inner, export_scroll)
 
-        # --- Bottom Section: Controls (always visible) ---
+        # --- Bottom Section: Controls (always visible, never scrolls) ---
         control_frame = ttk.Frame(main_frame)
         control_frame.pack(fill=tk.X, pady=(5, 0))
 
@@ -560,8 +603,12 @@ class TTSApp:
             return self.elevenlabs_api_key_var.get().strip()
         return self.api_key_var.get().strip()
 
-    def create_filters_tab(self, parent):
+    def create_filters_tab(self, parent, bind_scroll=None):
         """Build the Filters tab with checkbuttons and action buttons."""
+        def _bs(w):
+            if bind_scroll:
+                bind_scroll(w)
+
         # Description
         desc_label = ttk.Label(
             parent,
@@ -570,54 +617,31 @@ class TTSApp:
             wraplength=620
         )
         desc_label.pack(fill=tk.X, pady=(0, 10))
+        _bs(desc_label)
 
-        # Filter checkbuttons in a scrollable frame
+        # Filter checkbuttons
         filter_container = ttk.LabelFrame(parent, text="Available Filters", padding="10")
-        filter_container.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        filter_container.pack(fill=tk.X, pady=(0, 10))
+        _bs(filter_container)
 
-        # Canvas + scrollbar for the filter list
-        canvas = tk.Canvas(filter_container, highlightthickness=0)
-        filter_scrollbar = ttk.Scrollbar(filter_container, orient=tk.VERTICAL, command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas)
-
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        canvas.create_window((0, 0), window=scrollable_frame, anchor=tk.NW)
-        canvas.configure(yscrollcommand=filter_scrollbar.set)
-
-        # Populate filter checkbuttons
+        # Populate filter checkbuttons directly (tab itself scrolls now)
         for i, (key, label, description) in enumerate(self.filter_definitions):
-            row_frame = ttk.Frame(scrollable_frame)
+            row_frame = ttk.Frame(filter_container)
             row_frame.pack(fill=tk.X, pady=2)
+            _bs(row_frame)
 
             cb = ttk.Checkbutton(row_frame, text=label, variable=self.filter_vars[key])
             cb.pack(side=tk.LEFT)
+            _bs(cb)
 
             desc = ttk.Label(row_frame, text=f"  -  {description}", foreground="gray")
             desc.pack(side=tk.LEFT, padx=(5, 0))
-
-        filter_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        # Enable mouse wheel scrolling on the canvas
-        def on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        def on_mousewheel_linux(event):
-            if event.num == 4:
-                canvas.yview_scroll(-1, "units")
-            elif event.num == 5:
-                canvas.yview_scroll(1, "units")
-
-        canvas.bind("<MouseWheel>", on_mousewheel)
-        canvas.bind("<Button-4>", on_mousewheel_linux)
-        canvas.bind("<Button-5>", on_mousewheel_linux)
+            _bs(desc)
 
         # Action buttons
         btn_frame = ttk.Frame(parent)
         btn_frame.pack(fill=tk.X, pady=(0, 5))
+        _bs(btn_frame)
 
         ttk.Button(btn_frame, text="Select All", command=self.select_all_filters).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(btn_frame, text="Deselect All", command=self.deselect_all_filters).pack(side=tk.LEFT, padx=(0, 5))
@@ -712,23 +736,31 @@ class TTSApp:
         ttk.Button(btn_frame, text="Use This Text", command=use_filtered).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(btn_frame, text="Close", command=preview_win.destroy).pack(side=tk.LEFT)
 
-    def create_export_tab(self, parent):
+    def create_export_tab(self, parent, bind_scroll=None):
         """Build the Export tab with format selection, heading split, and export controls."""
+        def _bs(w):
+            if bind_scroll:
+                bind_scroll(w)
+
         # Description
-        ttk.Label(
+        desc = ttk.Label(
             parent,
             text="Export the text as audio files. Choose a format, optionally split by headings, "
                  "and select an output folder.",
             wraplength=620
-        ).pack(fill=tk.X, pady=(0, 10))
+        )
+        desc.pack(fill=tk.X, pady=(0, 10))
+        _bs(desc)
 
         # --- Export Settings ---
         settings_frame = ttk.LabelFrame(parent, text="Export Settings", padding="10")
         settings_frame.pack(fill=tk.X, pady=(0, 10))
+        _bs(settings_frame)
 
         # Format selection
         format_frame = ttk.Frame(settings_frame)
         format_frame.pack(fill=tk.X, pady=(0, 5))
+        _bs(format_frame)
 
         ttk.Label(format_frame, text="Format:").pack(side=tk.LEFT, padx=(0, 10))
         ttk.Radiobutton(format_frame, text="MP3", variable=self.export_format_var, value="mp3").pack(side=tk.LEFT, padx=(0, 10))
@@ -739,6 +771,7 @@ class TTSApp:
         # Split by headings option
         split_frame = ttk.Frame(settings_frame)
         split_frame.pack(fill=tk.X, pady=(5, 0))
+        _bs(split_frame)
 
         ttk.Checkbutton(
             split_frame,
@@ -751,7 +784,8 @@ class TTSApp:
 
         # --- Heading Preview ---
         self.heading_frame = ttk.LabelFrame(parent, text="Detected Headings", padding="10")
-        self.heading_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        self.heading_frame.pack(fill=tk.X, pady=(0, 10))
+        _bs(self.heading_frame)
 
         self.heading_list = tk.Text(self.heading_frame, height=6, wrap=tk.WORD, font=("Segoe UI", 9), state=tk.DISABLED)
         heading_scroll = ttk.Scrollbar(self.heading_frame, command=self.heading_list.yview)
@@ -762,9 +796,12 @@ class TTSApp:
         # --- Export Progress ---
         progress_frame = ttk.LabelFrame(parent, text="Export Progress", padding="10")
         progress_frame.pack(fill=tk.X, pady=(0, 10))
+        _bs(progress_frame)
 
         self.export_progress_var = tk.StringVar(value="No export in progress.")
-        ttk.Label(progress_frame, textvariable=self.export_progress_var, wraplength=620).pack(fill=tk.X)
+        ep_label = ttk.Label(progress_frame, textvariable=self.export_progress_var, wraplength=620)
+        ep_label.pack(fill=tk.X)
+        _bs(ep_label)
 
         self.export_progress_bar = ttk.Progressbar(progress_frame, mode='determinate')
         self.export_progress_bar.pack(fill=tk.X, pady=(5, 0))
@@ -778,6 +815,7 @@ class TTSApp:
         # --- Export Buttons ---
         btn_frame = ttk.Frame(parent)
         btn_frame.pack(fill=tk.X)
+        _bs(btn_frame)
 
         self.export_btn = ttk.Button(btn_frame, text="Export Audio", command=self.start_export)
         self.export_btn.pack(side=tk.LEFT, padx=(0, 5))
@@ -981,7 +1019,7 @@ class TTSApp:
                     completed_batches += 1
                     self.root.after(0, lambda n=completed_batches: self.export_progress_bar.configure(value=n))
                 except AuthenticationError:
-                    self.root.after(0, lambda p=self.provider_var.get(): messagebox.showerror("Error", f"Invalid {p} API Key."))
+                    self.root.after(0, lambda p=provider: messagebox.showerror("Error", f"Invalid {p} API Key."))
                     self.root.after(0, self.reset_export_ui)
                     return
                 except APIConnectionError:
@@ -1027,7 +1065,7 @@ class TTSApp:
                             completed_batches += 1
                             self.root.after(0, lambda n=completed_batches: self.export_progress_bar.configure(value=n))
                         except AuthenticationError:
-                            self.root.after(0, lambda p=self.provider_var.get(): messagebox.showerror("Error", f"Invalid {p} API Key."))
+                            self.root.after(0, lambda p=provider: messagebox.showerror("Error", f"Invalid {p} API Key."))
                             error_occurred = True
                             break
                         except APIConnectionError:
@@ -1162,6 +1200,7 @@ class TTSApp:
 
     def stop_audio(self):
         self.stop_requested = True
+        self.is_processing = False
         if pygame.mixer.music.get_busy():
             pygame.mixer.music.stop()
         self.play_btn.config(state=tk.NORMAL)
@@ -1240,7 +1279,7 @@ class TTSApp:
                     self.root.after(0, lambda n=generated_count: self.progress_bar.configure(value=n))
                     self.audio_queue.put((batch_num, temp_file))
                 except AuthenticationError:
-                    self.generator_error = f"Invalid {self.provider_var.get()} API Key."
+                    self.generator_error = f"Invalid {provider} API Key."
                     for f in futures.values():
                         f.cancel()
                     self.audio_queue.put(None)
@@ -1465,6 +1504,9 @@ class TTSApp:
         """Internal: generate and play TTS for the given text."""
         if self.is_processing:
             return
+
+        # Clear any leftover temp files from a previous run
+        self.cleanup_temp_files()
 
         api_key = self.get_current_api_key()
         provider = self.provider_var.get()
